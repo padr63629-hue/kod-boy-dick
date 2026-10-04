@@ -1,0 +1,1012 @@
+--============================================================
+-- VM 混淆器 + 双反篡改（修复版）
+-- 位置: StarterPlayer > StarterPlayerScripts (LocalScript)
+--============================================================
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+
+local CFG = {
+    DEAD_RATE   = 0.45,
+    DEAD_MIN    = 2,
+    DEAD_MAX    = 5,
+    DEAD_DEPTH  = 2,
+    DEBUG_ANTI  = true,   -- ← 关键：true 时所有检测失败都打印
+}
+
+--============================================================
+-- 1. Lexer
+--============================================================
+local KEYWORDS = {
+    and=true,break=true,do=true,else=true,elseif=true,end=true,false=true,
+    for=true,function=true,if=true,in=true,local=true,nil=true,not=true,
+    or=true,repeat=true,return=true,then=true,true=true,until=true,while=true,
+}
+local function lex(src)
+    local t, i, n = {}, 1, #src
+    local function push(ty, v) t[#t+1] = {ty=ty, v=v} end
+    while i <= n do
+        local c = src:sub(i,i)
+        if c:match("%s") then i = i + 1
+        elseif c == "-" and src:sub(i+1,i+1) == "-" then
+            local eqs = src:sub(i+1):match("^%-%[(=*)%[")
+            if eqs then
+                local close = "]"..eqs.."]"
+                local e = src:find(close, i+1, true)
+                i = e and (e + #close) or (n+1)
+            else
+                local e = src:find("\n", i, true); i = e or (n+1)
+            end
+        elseif c:match("%d") or (c == "." and src:sub(i+1,i+1):match("%d")) then
+            local s = i
+            if src:sub(i,i+1) == "0x" or src:sub(i,i+1) == "0X" then
+                i = i + 2
+                while i <= n and src:sub(i,i):match("[%da-fA-F]") do i = i + 1 end
+            else
+                while i <= n and src:sub(i,i):match("%d") do i = i + 1 end
+                if src:sub(i,i) == "." and src:sub(i+1,i+1) ~= "." and src:sub(i+1,i+1):match("%d") then
+                    i = i + 1
+                    while i <= n and src:sub(i,i):match("%d") do i = i + 1 end
+                end
+                if src:sub(i,i):match("[eE]") then
+                    i = i + 1
+                    if src:sub(i,i)=="+" or src:sub(i,i)=="-" then i = i + 1 end
+                    while i <= n and src:sub(i,i):match("%d") do i = i + 1 end
+                end
+            end
+            push("number", tonumber(src:sub(s,i-1)))
+        elseif c == '"' or c == "'" then
+            local q = c; i = i + 1
+            local buf = {}
+            while i <= n do
+                local d = src:sub(i,i)
+                if d == "\\" then
+                    local nc = src:sub(i+1,i+1)
+                    local map = {n="\n",t="\t",r="\r",["\\"]="\\",['"']='"',["'"]="'"}
+                    buf[#buf+1] = map[nc] or nc
+                    i = i + 2
+                elseif d == q then i = i + 1; break
+                else buf[#buf+1] = d; i = i + 1 end
+            end
+            push("string", table.concat(buf))
+        elseif c == "[" then
+            local eqs = src:sub(i):match("^%[(=*)%[")
+            if eqs then
+                local close = "]"..eqs.."]"
+                local s = i + #eqs + 2
+                local e = src:find(close, s, true)
+                if e then push("string", src:sub(s,e-1)); i = e + #close
+                else error("长字符串未闭合") end
+            else push("punct", "["); i = i + 1 end
+        elseif c:match("[%a_]") then
+            local s = i
+            while i <= n and src:sub(i,i):match("[%w_]") do i = i + 1 end
+            local w = src:sub(s,i-1)
+            if KEYWORDS[w] then push("keyword", w) else push("name", w) end
+        else
+            local t3 = src:sub(i,i+2); local t2 = src:sub(i,i+1)
+            if t3 == "..." then push("punct","..."); i = i + 3
+            elseif t2=="==" or t2=="~=" or t2=="<=" or t2==">=" or t2==".." then
+                push("punct", t2); i = i + 2
+            else push("punct", c); i = i + 1 end
+        end
+    end
+    push("eof")
+    return t
+end
+
+--============================================================
+-- 2. Parser
+--============================================================
+local BINOP = {
+    ["or"]={p=1}, ["and"]={p=2},
+    ["<"]={p=3}, [">"]={p=3}, ["<="]={p=3}, [">="]={p=3},
+    ["=="]={p=3}, ["~="]={p=3},
+    [".."]={p=4,r=true},
+    ["+"]={p=5}, ["-"]={p=5},
+    ["*"]={p=6}, ["/"]={p=6}, ["%"]={p=6},
+    ["^"]={p=8,r=true},
+}
+local UNOP = { ["not"]=7, ["-"]=7, ["#"]=7 }
+
+local P = {}
+P.__index = P
+function P.new(toks) return setmetatable({t=toks,i=1}, P) end
+function P:peek() return self.t[self.i] end
+function P:next() local t=self.t[self.i]; self.i=self.i+1; return t end
+function P:ck(ty,v) local t=self:peek(); return t.ty==ty and (v==nil or t.v==v) end
+function P:ac(ty,v) if self:ck(ty,v) then return self:next() end end
+function P:ex(ty,v) if not self:ck(ty,v) then error("期望 "..tostring(v or ty)) end; return self:next() end
+
+function P:parseBlock(stops)
+    local stmts = {}
+    while true do
+        local t = self:peek()
+        if t.ty == "eof" then break end
+        if t.ty == "keyword" and stops[t.v] then break end
+        if t.ty == "punct" and t.v == ";" then self:next()
+        else stmts[#stmts+1] = self:parseStatement() end
+    end
+    return stmts
+end
+
+function P:parseStatement()
+    local t = self:peek()
+    if t.ty == "keyword" then
+        if t.v == "local" then
+            self:next()
+            local name = self:ex("name").v
+            local init
+            if self:ac("punct","=") then init = self:parseExpr() end
+            return {tag="local", name=name, init=init}
+        elseif t.v == "if" then return self:parseIf()
+        elseif t.v == "while" then return self:parseWhile()
+        elseif t.v == "for" then return self:parseFor()
+        elseif t.v == "return" then
+            self:next()
+            local e = self:parseExpr()
+            return {tag="return", value=e}
+        elseif t.v == "do" then
+            self:next()
+            local b = self:parseBlock({["end"]=true})
+            self:ex("keyword","end")
+            return {tag="do", body=b}
+        end
+    elseif t.ty == "name" then
+        self:next()
+        local e = self:applySuffix({tag="name", name=t.v})
+        if self:ac("punct","=") then
+            local v = self:parseExpr()
+            return {tag="assign", target=e, value=v}
+        end
+        return {tag="callstmt", call=e}
+    end
+    error("无法解析语句: "..tostring(t.v))
+end
+
+function P:parseIf()
+    self:ex("keyword","if")
+    local cond = self:parseExpr()
+    self:ex("keyword","then")
+    local branches = {{cond=cond, body=self:parseBlock({["else"]=true,["elseif"]=true,["end"]=true})}}
+    while self:ac("keyword","elseif") do
+        local c = self:parseExpr()
+        self:ex("keyword","then")
+        local b = self:parseBlock({["else"]=true,["elseif"]=true,["end"]=true})
+        branches[#branches+1] = {cond=c, body=b}
+    end
+    local elseBody
+    if self:ac("keyword","else") then
+        elseBody = self:parseBlock({["end"]=true})
+    end
+    self:ex("keyword","end")
+    return {tag="if", branches=branches, elseBody=elseBody}
+end
+
+function P:parseWhile()
+    self:ex("keyword","while")
+    local cond = self:parseExpr()
+    self:ex("keyword","do")
+    local body = self:parseBlock({["end"]=true})
+    self:ex("keyword","end")
+    return {tag="while", cond=cond, body=body}
+end
+
+function P:parseFor()
+    self:ex("keyword","for")
+    local name = self:ex("name").v
+    self:ex("punct","=")
+    local f = self:parseExpr()
+    self:ex("punct",",")
+    local t = self:parseExpr()
+    local s
+    if self:ac("punct",",") then s = self:parseExpr() end
+    self:ex("keyword","do")
+    local body = self:parseBlock({["end"]=true})
+    self:ex("keyword","end")
+    return {tag="for", var=name, from=f, to=t, step=s, body=body}
+end
+
+function P:parseExpr(mp)
+    mp = mp or 1
+    local left = self:parseUnary()
+    while true do
+        local t = self:peek()
+        local k = (t.ty=="punct" or t.ty=="keyword") and t.v
+        local op = k and BINOP[k]
+        if not op or op.p < mp then break end
+        self:next()
+        local nm = op.r and op.p or (op.p + 1)
+        local right = self:parseExpr(nm)
+        left = {tag="binop", op=k, left=left, right=right}
+    end
+    return left
+end
+
+function P:parseUnary()
+    local t = self:peek()
+    local k = (t.ty=="punct" or t.ty=="keyword") and t.v
+    if k and UNOP[k] then
+        self:next()
+        local operand = self:parseExpr(UNOP[k])
+        return {tag="unop", op=k, operand=operand}
+    end
+    return self:parseSuffix()
+end
+
+function P:parsePrimary()
+    local t = self:peek()
+    if t.ty == "number" then self:next(); return {tag="number", value=t.v}
+    elseif t.ty == "string" then self:next(); return {tag="string", value=t.v}
+    elseif t.ty == "keyword" and t.v == "nil" then self:next(); return {tag="nil"}
+    elseif t.ty == "keyword" and t.v == "true" then self:next(); return {tag="bool", value=true}
+    elseif t.ty == "keyword" and t.v == "false" then self:next(); return {tag="bool", value=false}
+    elseif t.ty == "name" then self:next(); return {tag="name", name=t.v}
+    elseif t.ty == "punct" and t.v == "(" then
+        self:next(); local e = self:parseExpr(); self:ex("punct",")"); return e
+    end
+    error("无法解析表达式: "..tostring(t.v))
+end
+
+function P:parseSuffix() return self:applySuffix(self:parsePrimary()) end
+
+function P:applySuffix(e)
+    while true do
+        local t = self:peek()
+        if t.ty == "punct" and t.v == "(" then
+            self:next()
+            local args = {}
+            if not self:ck("punct",")") then
+                args[1] = self:parseExpr()
+                while self:ac("punct",",") do args[#args+1] = self:parseExpr() end
+            end
+            self:ex("punct",")")
+            e = {tag="call", func=e, args=args}
+        elseif t.ty == "punct" and t.v == "[" then
+            self:next()
+            local k = self:parseExpr()
+            self:ex("punct","]")
+            e = {tag="index", obj=e, key=k}
+        elseif t.ty == "punct" and t.v == "." then
+            self:next()
+            local nm = self:ex("name").v
+            e = {tag="index", obj=e, key={tag="string", value=nm}}
+        else break end
+    end
+    return e
+end
+
+--============================================================
+-- 3. Opcodes
+--============================================================
+local O = {
+    HALT=0, PUSH_NUM=1, PUSH_STR=2, PUSH_NIL=3, PUSH_TRUE=4, PUSH_FALSE=5,
+    GET_G=6, SET_G=7, GET_L=8, SET_L=9,
+    ADD=10, SUB=11, MUL=12, DIV=13, MOD=14, POW=15, CONCAT=16,
+    EQ=17, NEQ=18, LT=19, LE=20, GT=21, GE=22,
+    NOT=23, NEG=24, LEN=25,
+    CALL=26, RET=27, POP=28,
+    JMP=29, JF=30, JT=31, JFK=32, JTK=33,
+    GETI=34, SETI=35, NEWT=36,
+}
+
+--============================================================
+-- 4. Compiler
+--============================================================
+local C = {}
+C.__index = C
+function C.new() return setmetatable({code={}, consts={}, cmap={}, scopes={}, slotMax=0}, C) end
+function C:emit(op,a,b,c) self.code[#self.code+1] = {op,a,b,c}; return #self.code end
+function C:addConst(v)
+    if self.cmap[v] then return self.cmap[v] end
+    self.consts[#self.consts+1] = v
+    self.cmap[v] = #self.consts
+    return #self.consts
+end
+function C:pushScope() self.scopes[#self.scopes+1] = {} end
+function C:popScope() self.scopes[#self.scopes] = nil end
+function C:decl(name)
+    self.slotMax = self.slotMax + 1
+    self.scopes[#self.scopes][name] = self.slotMax
+    return self.slotMax
+end
+function C:res(name)
+    for i = #self.scopes, 1, -1 do
+        local s = self.scopes[i]
+        if s[name] then return s[name] end
+    end
+end
+
+function C:compileExpr(e)
+    local tg = e.tag
+    if tg == "number" then self:emit(O.PUSH_NUM, e.value)
+    elseif tg == "string" then self:emit(O.PUSH_STR, self:addConst(e.value))
+    elseif tg == "nil" then self:emit(O.PUSH_NIL)
+    elseif tg == "bool" then self:emit(e.value and O.PUSH_TRUE or O.PUSH_FALSE)
+    elseif tg == "name" then
+        local s = self:res(e.name)
+        if s then self:emit(O.GET_L, s)
+        else self:emit(O.GET_G, self:addConst(e.name)) end
+    elseif tg == "binop" then
+        local op = e.op
+        if op == "and" then
+            self:compileExpr(e.left)
+            local j = self:emit(O.JFK, 0)
+            self:compileExpr(e.right)
+            self.code[j][2] = #self.code + 1
+            return
+        elseif op == "or" then
+            self:compileExpr(e.left)
+            local j = self:emit(O.JTK, 0)
+            self:compileExpr(e.right)
+            self.code[j][2] = #self.code + 1
+            return
+        end
+        self:compileExpr(e.left)
+        self:compileExpr(e.right)
+        local map = {
+            ["+"]=O.ADD, ["-"]=O.SUB, ["*"]=O.MUL, ["/"]=O.DIV,
+            ["%"]=O.MOD, ["^"]=O.POW, [".."]=O.CONCAT,
+            ["=="]=O.EQ, ["~="]=O.NEQ,
+            ["<"]=O.LT, [">"]=O.GT, ["<="]=O.LE, [">="]=O.GE,
+        }
+        if map[op] then self:emit(map[op]) else error("不支持: "..op) end
+    elseif tg == "unop" then
+        self:compileExpr(e.operand)
+        if e.op == "not" then self:emit(O.NOT)
+        elseif e.op == "-" then self:emit(O.NEG)
+        elseif e.op == "#" then self:emit(O.LEN) end
+    elseif tg == "call" then
+        self:compileExpr(e.func)
+        for i=1,#e.args do self:compileExpr(e.args[i]) end
+        self:emit(O.CALL, #e.args)
+    elseif tg == "index" then
+        self:compileExpr(e.obj)
+        self:compileExpr(e.key)
+        self:emit(O.GETI)
+    end
+end
+
+function C:compileStmt(s)
+    local tg = s.tag
+    if tg == "local" then
+        if s.init then self:compileExpr(s.init) else self:emit(O.PUSH_NIL) end
+        local slot = self:decl(s.name)
+        self:emit(O.SET_L, slot)
+        self:emit(O.POP)
+    elseif tg == "assign" then
+        local t = s.target
+        if t.tag == "name" then
+            self:compileExpr(s.value)
+            local slot = self:res(t.name)
+            if slot then self:emit(O.SET_L, slot)
+            else self:emit(O.SET_G, self:addConst(t.name)) end
+            self:emit(O.POP)
+        elseif t.tag == "index" then
+            self:compileExpr(t.obj)
+            self:compileExpr(t.key)
+            self:compileExpr(s.value)
+            self:emit(O.SETI)
+            self:emit(O.POP)
+        end
+    elseif tg == "callstmt" then
+        self:compileExpr(s.call)
+        self:emit(O.POP)
+    elseif tg == "if" then self:compileIf(s)
+    elseif tg == "while" then self:compileWhile(s)
+    elseif tg == "for" then self:compileFor(s)
+    elseif tg == "return" then
+        if s.value then self:compileExpr(s.value) else self:emit(O.PUSH_NIL) end
+        self:emit(O.RET)
+    elseif tg == "do" then
+        self:pushScope(); self:compileBlock(s.body); self:popScope()
+    end
+end
+
+function C:compileBlock(ss)
+    for i=1,#ss do self:compileStmt(ss[i]) end
+end
+
+function C:compileIf(s)
+    local ends = {}
+    for i, br in ipairs(s.branches) do
+        self:compileExpr(br.cond)
+        local jf = self:emit(O.JF, 0)
+        self:pushScope(); self:compileBlock(br.body); self:popScope()
+        if i < #s.branches or s.elseBody then
+            ends[#ends+1] = self:emit(O.JMP, 0)
+        end
+        self.code[jf][2] = #self.code + 1
+    end
+    if s.elseBody then
+        self:pushScope(); self:compileBlock(s.elseBody); self:popScope()
+    end
+    local e = #self.code + 1
+    for i=1,#ends do self.code[ends[i]][2] = e end
+end
+
+function C:compileWhile(s)
+    local start = #self.code + 1
+    self:compileExpr(s.cond)
+    local jf = self:emit(O.JF, 0)
+    self:pushScope(); self:compileBlock(s.body); self:popScope()
+    self:emit(O.JMP, start)
+    self.code[jf][2] = #self.code + 1
+end
+
+function C:compileFor(s)
+    local sv = self:decl(s.var)
+    local sl = self:decl("__lim_"..s.var)
+    local st = self:decl("__stp_"..s.var)
+    self:compileExpr(s.from); self:emit(O.SET_L, sv); self:emit(O.POP)
+    self:compileExpr(s.to);   self:emit(O.SET_L, sl); self:emit(O.POP)
+    if s.step then self:compileExpr(s.step) else self:emit(O.PUSH_NUM, 1) end
+    self:emit(O.SET_L, st); self:emit(O.POP)
+    local start = #self.code + 1
+    self:emit(O.GET_L, sv); self:emit(O.GET_L, sl); self:emit(O.GT)
+    local jf = self:emit(O.JT, 0)
+    self:pushScope(); self:compileBlock(s.body); self:popScope()
+    self:emit(O.GET_L, sv); self:emit(O.GET_L, st); self:emit(O.ADD)
+    self:emit(O.SET_L, sv); self:emit(O.POP)
+    self:emit(O.JMP, start)
+    self.code[jf][2] = #self.code + 1
+end
+
+--============================================================
+-- 5. 死代码注入
+--============================================================
+local function randId()
+    local c = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+    local n = math.random(6, 12)
+    local t = {}
+    for i=1,n do local k = math.random(1,#c); t[i] = c:sub(k,k) end
+    return table.concat(t)
+end
+
+local function makeDeadStmt()
+    local ty = math.random(1, 5)
+    if ty == 1 then
+        return {tag="local", name=randId(), init={tag="number", value=math.random(1,999999)}}
+    elseif ty == 2 then
+        return {tag="local", name=randId(), init={tag="binop", op="+",
+            left={tag="number", value=math.random(1,9999)},
+            right={tag="number", value=math.random(1,9999)}}}
+    elseif ty == 3 then
+        return {tag="assign", target={tag="name", name=randId()},
+            value={tag="number", value=math.random(1,9999)}}
+    elseif ty == 4 then
+        return {tag="callstmt", call={tag="call", func={tag="name", name="print"},
+            args={{tag="string", value=randId()}, {tag="number", value=math.random(1,9999)}}}}
+    else
+        return {tag="local", name=randId(), init={tag="string", value=randId()}}
+    end
+end
+
+local function makeDeadBlock(depth)
+    local n = math.random(CFG.DEAD_MIN, CFG.DEAD_MAX)
+    local body = {}
+    for i=1,n do body[#body+1] = makeDeadStmt() end
+    local block = {tag="if", branches={{cond={tag="bool", value=false}, body=body}}}
+    if depth > 1 then table.insert(body, makeDeadBlock(depth - 1)) end
+    return block
+end
+
+local function injectDead(stmts, depth)
+    local out = {}
+    for i=1,#stmts do
+        out[#out+1] = stmts[i]
+        if math.random() < CFG.DEAD_RATE then
+            out[#out+1] = makeDeadBlock(depth)
+        end
+    end
+    for i=#stmts,1,-1 do stmts[i] = nil end
+    for i=1,#out do stmts[i] = out[i] end
+    for _, s in ipairs(stmts) do
+        if s.branches then
+            for _, br in ipairs(s.branches) do injectDead(br.body, depth) end
+        end
+        if s.elseBody then injectDead(s.elseBody, depth) end
+        if s.body and s.body[1] and s.body[1].tag then injectDead(s.body, depth) end
+    end
+end
+
+--============================================================
+-- 6. 序列化
+--============================================================
+local function xorHex(str, key)
+    local out = {}
+    for i=1,#str do
+        local b = string.byte(str, i)
+        local k = string.byte(key, ((i-1) % #key) + 1)
+        out[i] = string.format("%02x", bit32.bxor(b, k))
+    end
+    return table.concat(out)
+end
+
+local function randKey()
+    local t = {}
+    for i=1,16 do t[i] = string.char(math.random(33, 126)) end
+    return table.concat(t)
+end
+
+local function serializeConsts(consts, key)
+    local parts = {}
+    for i=1,#consts do
+        local v = consts[i]
+        if type(v) == "string" then parts[i] = '"'..xorHex(v, key)..'"'
+        elseif v == nil then parts[i] = "nil"
+        elseif type(v) == "boolean" then parts[i] = tostring(v)
+        else parts[i] = tostring(v) end
+    end
+    return "{"..table.concat(parts,",").."}"
+end
+
+local function serializeCode(code)
+    local parts = {}
+    for i=1,#code do
+        local ins = code[i]
+        local p = {tostring(ins[1])}
+        for j=2,4 do if ins[j] ~= nil then p[#p+1] = tostring(ins[j]) end end
+        parts[i] = "{"..table.concat(p,",").."}"
+    end
+    return "{"..table.concat(parts,",").."}"
+end
+
+--============================================================
+-- 7. VM 运行时
+--============================================================
+local VM_RUNTIME = [==[
+do
+    for __i=1,#__c do
+        if type(__c[__i])=="string" and #__c[__i]>0 then
+            __c[__i]=__d(__c[__i])
+        end
+    end
+    local __st,__sp={},0
+    local __lc,__pc={},1
+    local __env=_G
+    local __up=unpack or table.unpack
+    local function __push(v) __sp=__sp+1 __st[__sp]=v end
+    local function __pop() local v=__st[__sp] __st[__sp]=nil __sp=__sp-1 return v end
+    local function __peek() return __st[__sp] end
+    while true do
+        local __ins=__b[__pc]
+        if not __ins then break end
+        local __op=__ins[1]
+        local __jmp=false
+        if __op==0 then break
+        elseif __op==1 then __push(__ins[2])
+        elseif __op==2 then __push(__c[__ins[2]])
+        elseif __op==3 then __push(nil)
+        elseif __op==4 then __push(true)
+        elseif __op==5 then __push(false)
+        elseif __op==6 then __push(__env[__c[__ins[2]]])
+        elseif __op==7 then __env[__c[__ins[2]]]=__pop()
+        elseif __op==8 then __push(__lc[__ins[2]])
+        elseif __op==9 then __lc[__ins[2]]=__peek()
+        elseif __op==10 then local b=__pop() local a=__pop() __push(a+b)
+        elseif __op==11 then local b=__pop() local a=__pop() __push(a-b)
+        elseif __op==12 then local b=__pop() local a=__pop() __push(a*b)
+        elseif __op==13 then local b=__pop() local a=__pop() __push(a/b)
+        elseif __op==14 then local b=__pop() local a=__pop() __push(a%b)
+        elseif __op==15 then local b=__pop() local a=__pop() __push(a^b)
+        elseif __op==16 then local b=__pop() local a=__pop() __push(a..b)
+        elseif __op==17 then local b=__pop() local a=__pop() __push(a==b)
+        elseif __op==18 then local b=__pop() local a=__pop() __push(a~=b)
+        elseif __op==19 then local b=__pop() local a=__pop() __push(a<b)
+        elseif __op==20 then local b=__pop() local a=__pop() __push(a<=b)
+        elseif __op==21 then local b=__pop() local a=__pop() __push(a>b)
+        elseif __op==22 then local b=__pop() local a=__pop() __push(a>=b)
+        elseif __op==23 then __push(not __pop())
+        elseif __op==24 then __push(-__pop())
+        elseif __op==25 then __push(#__pop())
+        elseif __op==26 then
+            local n=__ins[2]
+            local __a={}
+            for i=n,1,-1 do __a[i]=__pop() end
+            local __f=__pop()
+            __push(__f(__up(__a)))
+        elseif __op==27 then break
+        elseif __op==28 then __pop()
+        elseif __op==29 then __pc=__ins[2] __jmp=true
+        elseif __op==30 then
+            if not __pop() then __pc=__ins[2] __jmp=true end
+        elseif __op==31 then
+            if __pop() then __pc=__ins[2] __jmp=true end
+        elseif __op==32 then
+            if not __peek() then __pc=__ins[2] __jmp=true else __pop() end
+        elseif __op==33 then
+            if __peek() then __pc=__ins[2] __jmp=true else __pop() end
+        elseif __op==34 then local k=__pop() local t=__pop() __push(t[k])
+        elseif __op==35 then
+            local v=__pop() local k=__pop() local t=__pop()
+            t[k]=v __push(v)
+        elseif __op==36 then __push({})
+        end
+        if not __jmp then __pc=__pc+1 end
+    end
+end
+]==]
+
+--============================================================
+-- 8. 反篡改（带调试输出，脆弱项已移除）
+--============================================================
+local ANTI_HEAD = [==[
+local __DBG = __DEBUG_FLAG__
+local function __RF(n)
+    if __DBG then warn("[anti] 检测失败: "..n) end
+    return true
+end
+]==]
+
+local ANTI_BODY = [==[
+if type(game) ~= "userdata" then return __RF("game") end
+if type(workspace) ~= "userdata" then return __RF("workspace") end
+if not rawequal(game:GetService("Workspace"), workspace) then return __RF("workspace-identity") end
+if type(Instance) ~= "table" or type(Instance.new) ~= "function" then return __RF("Instance") end
+if type(task) ~= "table" then return __RF("task") end
+if type(buffer) ~= "table" then return __RF("buffer") end
+if type(debug) ~= "table" or type(debug.info) ~= "function" then return __RF("debug") end
+
+do
+    local s, l, _, a, v = debug.info(Instance.new, "slnaf")
+    if s ~= "[C]" or l ~= -1 or a ~= 0 or v ~= true then return __RF("meta-Instance.new") end
+end
+do
+    local s, l, _, a, v = debug.info(UDim2.new, "slnaf")
+    if s ~= "[C]" or l ~= -1 or a ~= 0 or v ~= true then return __RF("meta-UDim2.new") end
+end
+do
+    local s, l, _, a, v = debug.info(Random.new, "slnaf")
+    if s ~= "[C]" or l ~= -1 or a ~= 0 or v ~= true then return __RF("meta-Random.new") end
+end
+
+do
+    local ok, a, b, c = pcall(function() return 17, nil, 29 end)
+    if not ok or a ~= 17 or b ~= nil or c ~= 29 then return __RF("pcall-pack") end
+end
+do
+    local ok, r = xpcall(function() error("s", 0) end, function(m) return "c:"..tostring(m) end)
+    if ok or r ~= "c:s" then return __RF("xpcall") end
+end
+
+do
+    if not buffer then return end
+    local b = buffer.create(24)
+    buffer.writeu32(b, 0, 0x12345678)
+    buffer.writef64(b, 4, math.pi)
+    buffer.writestring(b, 12, "LPH}")
+    if buffer.readu32(b, 0) ~= 0x12345678 then return __RF("buffer-u32") end
+    if math.abs(buffer.readf64(b, 4) - math.pi) > 1e-15 then return __RF("buffer-f64") end
+    if buffer.readstring(b, 12, 4) ~= "LPH}" then return __RF("buffer-str") end
+end
+
+do
+    local p = Instance.new("Part")
+    local t = {}
+    p:GetPropertyChangedSignal("Size"):Connect(function()
+        table.insert(t, p.Size)
+    end)
+    local n = math.random(1, 7)
+    p.Size = Vector3.new(n, n, n)
+    task.wait(0.05)
+    local bad = (#t == 0 or t[#t].X ~= n)
+    p:Destroy()
+    if bad then return __RF("PropChanged-signal") end
+end
+
+do
+    local ok = pcall(function()
+        local fr = Instance.new("Frame")
+        local ts = game:GetService("TweenService")
+        local tw = ts:Create(fr, TweenInfo.new(0.01), {Position = UDim2.fromScale(1, 1)})
+        tw:Play()
+        tw.Completed:Wait()
+        fr:Destroy()
+    end)
+    if not ok then return __RF("TweenService") end
+end
+
+do
+    local o = Instance.new("DataStoreIncrementOptions")
+    local d = {hi = true}
+    o:SetMetadata(d)
+    local ok = (o:GetMetadata().hi == d.hi)
+    o:Destroy()
+    if not ok then return __RF("DataStore-metadata") end
+end
+
+do
+    local f = Instance.new("Folder")
+    f.Name = "AntiEnvFolder"
+    if not f:IsA("Folder") or not f:IsA("Instance") then f:Destroy() return __RF("Folder-IsA") end
+    if f:IsA("Part") then f:Destroy() return __RF("Folder-IsA-Part") end
+    f:SetAttribute("marker", 17)
+    f:Destroy()
+    if f.Parent ~= nil then return __RF("Folder-Parent") end
+    if f:GetAttribute("marker") ~= 17 then return __RF("Folder-Attr") end
+    if #f:GetChildren() ~= 0 then return __RF("Folder-Children") end
+end
+
+do
+    local ev = Instance.new("BindableEvent")
+    local s1, s2 = ev.Event, ev.Event
+    if s1 ~= s2 then return __RF("signal-identity") end
+    if rawequal(s1, s2) then return __RF("signal-raw") end
+    if typeof(s1) ~= "RBXScriptSignal" then return __RF("signal-typeof") end
+    local c = s1:Connect(function() end)
+    if c.Connected ~= true then return __RF("conn-Connected-true") end
+    if pcall(c.Disconnect) then return __RF("conn-missing-self") end
+    c:Disconnect()
+    if c.Connected ~= false then return __RF("conn-Connected-false") end
+    ev:Destroy()
+end
+
+do
+    local rs = game:GetService("RunService")
+    local ic, is = rs:IsClient(), rs:IsServer()
+    if ic == is then return __RF("RunService-context") end
+    if type(ic) ~= "boolean" or type(is) ~= "boolean" then return __RF("RunService-type") end
+    if pcall(rs.IsStudio) then return __RF("RunService-dot-call") end
+end
+
+do
+    if Enum.HumanoidStateType:FromValue(0) ~= Enum.HumanoidStateType.FallingDown then
+        return __RF("Enum-FromValue")
+    end
+    if Enum.HumanoidStateType:FromName("X") ~= nil then return __RF("Enum-FromName") end
+end
+
+do
+    local ok, env = pcall(function()
+        if type(getgenv) == "function" then return getgenv() end
+        if type(getfenv) == "function" then return getfenv(0) end
+        return nil
+    end)
+    if ok and type(env) == "table" then
+        local lw = rawget(env, "wait")
+        if type(lw) == "function" and rawequal(lw, task.wait) then return __RF("legacy-wait-alias") end
+        local ls = rawget(env, "spawn")
+        if type(ls) == "function" and rawequal(ls, task.spawn) then return __RF("legacy-spawn-alias") end
+        local ld = rawget(env, "delay")
+        if type(ld) == "function" and rawequal(ld, task.delay) then return __RF("legacy-delay-alias") end
+    end
+end
+
+if __DBG then print("[anti] 全部检测通过 ✔") end
+]==]
+
+--============================================================
+-- 9. 主入口
+--============================================================
+local function obfuscate(src)
+    local toks = lex(src)
+    local parser = P.new(toks)
+    local ast = parser:parseBlock({})
+    injectDead(ast, CFG.DEAD_DEPTH)
+    local c = C.new()
+    c:pushScope()
+    c:compileBlock(ast)
+    c:emit(O.HALT)
+    c:popScope()
+
+    local key = randKey()
+    local dbgStr = CFG.DEBUG_ANTI and "true" or "false"
+    local antiHead = ANTI_HEAD:gsub("__DEBUG_FLAG__", dbgStr)
+
+    local header =
+        'local __k=' .. string.format("%q", key) .. '\n' ..
+        'local __d=function(h)\n' ..
+        'local t={}\n' ..
+        'for i=1,#h,2 do\n' ..
+        'local b=tonumber(h:sub(i,i+1),16)\n' ..
+        'local k=string.byte(__k,((i-1)//2%#__k)+1)\n' ..
+        't[#t+1]=string.char(bit32.bxor(b,k))\n' ..
+        'end\n' ..
+        'return table.concat(t)\n' ..
+        'end\n' ..
+        'local __c=' .. serializeConsts(c.consts, key) .. '\n' ..
+        'local __b=' .. serializeCode(c.code) .. '\n'
+
+    return header .. antiHead .. ANTI_BODY .. "\n" .. VM_RUNTIME
+end
+
+--============================================================
+-- 10. UI
+--============================================================
+local CUI = {
+    bg=Color3.fromRGB(28,28,34), title=Color3.fromRGB(42,42,52),
+    text=Color3.fromRGB(230,230,240), subtle=Color3.fromRGB(150,150,165),
+    blue=Color3.fromRGB(60,130,220), green=Color3.fromRGB(60,180,110),
+    red=Color3.fromRGB(210,70,70), gray=Color3.fromRGB(80,80,95),
+    input=Color3.fromRGB(20,20,26),
+}
+local function corner(p, r)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = p
+end
+local function pad(p, px)
+    local u = Instance.new("UIPadding")
+    u.PaddingLeft=UDim.new(0,px) u.PaddingRight=UDim.new(0,px)
+    u.PaddingTop=UDim.new(0,px)  u.PaddingBottom=UDim.new(0,px)
+    u.Parent = p
+end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "RbxVM_Anti_UI" sg.ResetOnSpawn = false
+sg.IgnoreGuiInset = true sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent = player:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 460, 0, 340)
+main.Position = UDim2.new(0.5, -230, 0.5, -170)
+main.BackgroundColor3 = CUI.bg main.BorderSizePixel = 0 main.Active = true
+main.Parent = sg corner(main, 10)
+
+local tb = Instance.new("Frame")
+tb.Size = UDim2.new(1, 0, 0, 30) tb.BackgroundColor3 = CUI.title
+tb.BorderSizePixel = 0 tb.Parent = main corner(tb, 10)
+local tf = Instance.new("Frame")
+tf.Size = UDim2.new(1, 0, 0, 10) tf.Position = UDim2.new(0, 0, 1, -10)
+tf.BackgroundColor3 = CUI.title tf.BorderSizePixel = 0 tf.Parent = tb
+
+local ttl = Instance.new("TextLabel")
+ttl.Size = UDim2.new(1, -44, 1, 0) ttl.Position = UDim2.new(0, 12, 0, 0)
+ttl.BackgroundTransparency = 1 ttl.Text = "🔒 VM + 反篡改 混淆器"
+ttl.TextColor3 = CUI.text ttl.Font = Enum.Font.GothamBold ttl.TextSize = 13
+ttl.TextXAlignment = Enum.TextXAlignment.Left ttl.Parent = tb
+
+local cl = Instance.new("TextButton")
+cl.Size = UDim2.new(0, 22, 0, 22) cl.Position = UDim2.new(1, -28, 0, 4)
+cl.BackgroundColor3 = CUI.red cl.Text = "✕" cl.TextColor3 = Color3.new(1,1,1)
+cl.Font = Enum.Font.GothamBold cl.TextSize = 12 cl.BorderSizePixel = 0 cl.Parent = tb
+corner(cl, 5) cl.MouseButton1Click:Connect(function() sg:Destroy() end)
+
+do
+    local drag, ds, sp
+    tb.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            drag = true ds = inp.Position sp = main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if drag and (inp.UserInputType == Enum.UserInputType.MouseMovement
+        or inp.UserInputType == Enum.UserInputType.Touch) then
+            local d = inp.Position - ds
+            main.Position = UDim2.new(sp.X.Scale, sp.X.Offset+d.X, sp.Y.Scale, sp.Y.Offset+d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then drag = false end
+    end)
+end
+
+local il = Instance.new("TextLabel")
+il.Size = UDim2.new(0, 200, 0, 14) il.Position = UDim2.new(0, 14, 0, 38)
+il.BackgroundTransparency = 1 il.Text = "▸ 原始代码"
+il.TextColor3 = CUI.subtle il.Font = Enum.Font.GothamBold il.TextSize = 11
+il.TextXAlignment = Enum.TextXAlignment.Left il.Parent = main
+
+local ol = Instance.new("TextLabel")
+ol.Size = UDim2.new(0, 200, 0, 14) ol.Position = UDim2.new(0, 246, 0, 38)
+ol.BackgroundTransparency = 1 ol.Text = "▸ 输出（含反篡改）"
+ol.TextColor3 = CUI.subtle ol.Font = Enum.Font.GothamBold ol.TextSize = 11
+ol.TextXAlignment = Enum.TextXAlignment.Left ol.Parent = main
+
+local function mkBox(x)
+    local b = Instance.new("TextBox")
+    b.Size = UDim2.new(0, 200, 0, 232) b.Position = UDim2.new(0, x, 0, 54)
+    b.BackgroundColor3 = CUI.input b.BorderSizePixel = 0
+    b.Text = "" b.PlaceholderColor3 = Color3.fromRGB(90,90,105)
+    b.TextColor3 = CUI.text b.Font = Enum.Font.Code b.TextSize = 12
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    b.TextYAlignment = Enum.TextYAlignment.Top
+    b.TextWrapped = true b.MultiLine = true b.ClearTextOnFocus = false
+    b.Parent = main corner(b, 6) pad(b, 6)
+    return b
+end
+
+local iBox = mkBox(14)
+iBox.PlaceholderText = "-- 粘贴源码"
+local oBox = mkBox(246)
+oBox.PlaceholderText = "-- 输出"
+
+-- 调试开关
+local dbgBtn = Instance.new("TextButton")
+dbgBtn.Size = UDim2.new(0, 70, 0, 16)
+dbgBtn.Position = UDim2.new(0, 14, 0, 288)
+dbgBtn.BackgroundColor3 = CFG.DEBUG_ANTI and CUI.green or CUI.gray
+dbgBtn.Text = CFG.DEBUG_ANTI and "🐛 调试:开" or "🐛 调试:关"
+dbgBtn.TextColor3 = Color3.new(1,1,1)
+dbgBtn.Font = Enum.Font.GothamBold dbgBtn.TextSize = 10
+dbgBtn.BorderSizePixel = 0 dbgBtn.Parent = main
+corner(dbgBtn, 4)
+dbgBtn.MouseButton1Click:Connect(function()
+    CFG.DEBUG_ANTI = not CFG.DEBUG_ANTI
+    dbgBtn.Text = CFG.DEBUG_ANTI and "🐛 调试:开" or "🐛 调试:关"
+    dbgBtn.BackgroundColor3 = CFG.DEBUG_ANTI and CUI.green or CUI.gray
+end)
+
+local BY, BH = 308, 24
+local function mkBtn(text, color, x, w)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, w, 0, BH) b.Position = UDim2.new(0, x, 0, BY)
+    b.BackgroundColor3 = color b.Text = text
+    b.TextColor3 = Color3.new(1,1,1) b.Font = Enum.Font.GothamBold
+    b.TextSize = 11 b.BorderSizePixel = 0 b.Parent = main corner(b, 5)
+    return b
+end
+
+local bObf  = mkBtn("⚡ 混淆", CUI.blue,  92,  86)
+local bCopy = mkBtn("📋 复制", CUI.green, 182, 86)
+local bEx   = mkBtn("📄 示例", CUI.gray,  272, 86)
+local bClr  = mkBtn("🗑 清空", CUI.red,   362, 86)
+
+local st = Instance.new("TextLabel")
+st.Size = UDim2.new(0, 432, 0, 14) st.Position = UDim2.new(0, 14, 0, 334 - 336 + 0)
+st.Position = UDim2.new(0, 14, 1, -14)
+st.BackgroundTransparency = 1 st.Text = "" st.TextColor3 = CUI.subtle
+st.Font = Enum.Font.Gotham st.TextSize = 10
+st.TextXAlignment = Enum.TextXAlignment.Right
+st.TextTruncate = Enum.TextTruncate.AtEnd
+st.Parent = main
+
+local stTimer
+local function setSt(msg, color)
+    st.Text = msg st.TextColor3 = color or CUI.subtle
+    if stTimer then task.cancel(stTimer) end
+    stTimer = task.delay(5, function() st.Text = "" end)
+end
+
+bObf.MouseButton1Click:Connect(function()
+    local src = iBox.Text
+    if #src == 0 then setSt("⚠ 请输入代码", CUI.red) return end
+    setSt("⏳ 编译中...", CUI.subtle)
+    task.wait()
+    local ok, result = pcall(obfuscate, src)
+    if ok then
+        oBox.Text = result
+        local ratio = math.floor(#result / math.max(1, #src) + 0.5)
+        setSt(string.format("✔ %d → %d 字 (×%d)", #src, #result, ratio), CUI.green)
+    else
+        oBox.Text = "-- 错误: " .. tostring(result)
+        setSt("✖ 编译失败: " .. tostring(result):sub(1, 40), CUI.red)
+    end
+end)
+
+bCopy.MouseButton1Click:Connect(function()
+    if #oBox.Text == 0 then setSt("⚠ 无内容", CUI.red) return end
+    if setclipboard then
+        pcall(setclipboard, oBox.Text)
+        setSt("✔ 已复制 " .. #oBox.Text .. " 字", CUI.green)
+    else
+        oBox:CaptureFocus()
+        setSt("请手动 Ctrl+A / Ctrl+C", CUI.subtle)
+    end
+end)
+
+bEx.MouseButton1Click:Connect(function()
+    iBox.Text = [[
+local Players = game:GetService("Players")
+local p = Players.LocalPlayer
+print("Hello, " .. p.Name)
+local n = 10
+for i = 1, n do
+    print("计数:", i)
+end
+if n > 5 then
+    print("大于5")
+else
+    print("小于等于5")
+end
+]]
+    setSt("已加载示例", CUI.subtle)
+end)
+
+bClr.MouseButton1Click:Connect(function()
+    iBox.Text = "" oBox.Text = "" setSt("已清空", CUI.subtle)
+end)
+
+setSt("就绪 · 默认开调试，输出运行会 warn 失败项", CUI.subtle)
